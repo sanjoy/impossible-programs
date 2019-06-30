@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -34,6 +36,35 @@ template <typename T> struct is_optional<std::optional<T>> {
 using Bit = bool;
 using Natural = uint64_t;
 
+class BitSet {
+public:
+  void Clear() { rep_.clear(); }
+
+  void Insert(Natural idx) {
+    if (idx >= rep_.size()) {
+      rep_.resize(idx + 1, false);
+    }
+    size_ += !rep_[idx];
+    rep_[idx] = true;
+  }
+
+  bool Contains(Natural idx) const { return idx < rep_.size() && rep_[idx]; }
+
+  template <typename FnTy> void ForEach(FnTy func) {
+    for (Natural i = 0, e = rep_.size(); i < e; i++) {
+      if (rep_[i]) {
+        func(i);
+      }
+    }
+  }
+
+  int64_t size() const { return size_; }
+
+private:
+  int64_t size_ = 0;
+  std::vector<bool> rep_;
+};
+
 class BitStream {
 public:
   virtual std::optional<Bit> Get(Natural) = 0;
@@ -42,43 +73,37 @@ public:
 
 class StrictBitStream : public BitStream {
 public:
-  explicit StrictBitStream(std::vector<Bit> values)
-      : values_(std::move(values)) {}
-  std::optional<Bit> Get(Natural idx) override { return values_[idx]; }
+  explicit StrictBitStream(std::vector<Bit> values) : rep_(std::move(values)) {}
+  std::optional<Bit> Get(Natural idx) override { return rep_[idx]; }
   virtual ~StrictBitStream() override {}
 
 private:
-  std::vector<bool> values_;
+  std::vector<bool> rep_;
 };
 
 class LazyBitStream : public BitStream {
 public:
-  explicit LazyBitStream(const std::vector<Bit> *values) : values_(*values) {}
+  explicit LazyBitStream(const std::vector<Bit> *values,
+                         const BitSet *indices_present,
+                         BitSet *indices_requested)
+      : values_(*values), indices_present_(*indices_present),
+        indices_requested_(indices_requested) {}
   virtual ~LazyBitStream() override {}
 
   std::optional<Bit> Get(Natural idx) override {
-    if (idx >= values_.size()) {
-      max_index_requested_ = std::max(max_index_requested_, idx);
-      return std::nullopt;
+    if (indices_present_.Contains(idx)) {
+      return values_[idx];
     }
 
-    return values_[idx];
+    indices_requested_->Insert(idx);
+    return std::nullopt;
   }
-
-  Natural max_index_requested() const { return max_index_requested_; }
 
 private:
-  Natural max_index_requested_ = 0;
   const std::vector<bool> &values_;
+  const BitSet &indices_present_;
+  BitSet *indices_requested_;
 };
-
-using Predicate = std::function<std::optional<Bit>(BitStream *)>;
-
-void IntegerToBits(uint64_t integer, std::vector<bool> *bits) {
-  for (int i = 0; i < bits->size(); i++) {
-    (*bits)[i] = integer & (1ull << i);
-  }
-}
 
 class OnlyOneActiveFind {
 public:
@@ -98,50 +123,81 @@ private:
 
 /*static*/ bool thread_local OnlyOneActiveFind::find_is_active_ = false;
 
-std::unique_ptr<BitStream> Find(Predicate predicate) {
+template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
   OnlyOneActiveFind nfs;
 
-  uint64_t current_modulus = 0;
   std::vector<bool> scratch;
+  BitSet indices_of_bits_present;
+  BitSet indices_of_bits_requested;
   while (true) {
-    scratch.clear();
-    scratch.resize(current_modulus);
     bool current_modulus_too_small = false;
-    for (uint64_t i = 0; i < 1ull << current_modulus; i++) {
-      IntegerToBits(i, &scratch);
+    LOG("Entering inner loop with indices_of_bits_present.size() = %lld",
+        indices_of_bits_present.size());
+    std::vector<int> indices_of_bits_present_vect;
+    indices_of_bits_present.ForEach(
+        [&](Natural n) { indices_of_bits_present_vect.push_back(n); });
+    scratch.assign(scratch.size(), false);
+    for (uint64_t i = 0, e = 1ull << (1 + indices_of_bits_present.size());
+         i < e; i++) {
+      for (int idx : indices_of_bits_present_vect) {
+        if (!scratch[idx]) {
+          scratch[idx] = true;
+          break;
+        } else {
+          scratch[idx] = false;
+        }
+      }
 
-      LazyBitStream lazy_cantor(&scratch);
+#ifdef ENABLE_LOG
+      bool enable_verbose_log = false;
+      if (enable_verbose_log) {
+        std::string scratch_str;
+        for (bool b : scratch) {
+          scratch_str += b ? "1 " : "0 ";
+          ;
+        }
+        LOG("Scratch = %s", scratch_str.c_str());
+      }
+#endif
 
-      std::optional<Bit> result = predicate(&lazy_cantor);
+      LazyBitStream lazy_bit_stream(&scratch, &indices_of_bits_present,
+                                    &indices_of_bits_requested);
+
+      std::optional<Bit> result = predicate(&lazy_bit_stream);
       if (result.has_value() && *result) {
-        LOG("Returning at %llu", i);
-        return std::make_unique<StrictBitStream>(std::move(scratch));
+        return true;
       }
 
       if (!result.has_value()) {
-        LOG("Current modulus, %llu, too small, increasing to %llu",
-            current_modulus, lazy_cantor.max_index_requested() + 1);
-        current_modulus = lazy_cantor.max_index_requested() + 1;
+        Natural new_scratch_size = scratch.size();
+        indices_of_bits_requested.ForEach([&](Natural requested_index) {
+          LOG("New index requested: %llu", requested_index);
+          indices_of_bits_present.Insert(requested_index);
+          new_scratch_size = std::max(new_scratch_size, requested_index + 1);
+        });
+        scratch.resize(new_scratch_size);
         current_modulus_too_small = true;
+        indices_of_bits_requested.Clear();
         break;
       }
     }
 
     if (!current_modulus_too_small) {
-      LOG("Not found, modulus = %llu", current_modulus);
-      return std::make_unique<StrictBitStream>(std::move(scratch));
-    } else {
-      current_modulus++;
+#ifdef ENABLE_LOG
+      std::string indices_of_bits_present_str;
+      indices_of_bits_present.ForEach([&](Natural idx) {
+        indices_of_bits_present_str += std::to_string(idx);
+        indices_of_bits_present_str += " ";
+      });
+      LOG("Tried all possibilities with %s",
+          indices_of_bits_present_str.c_str());
+#endif
+      return false;
     }
   }
 }
 
-Bit ForSome(std::function<std::optional<Bit>(BitStream *)> pred) {
-  std::unique_ptr<BitStream> idx = Find(pred);
-  return *pred(idx.get());
-}
-
-Bit ForEvery(std::function<std::optional<Bit>(BitStream *)> pred) {
+template <typename PredicateTy> Bit ForEvery(PredicateTy pred) {
   auto inverse_pred = [=](BitStream *c) -> std::optional<Bit> {
     ASSIGN_OR_RETURN(Bit, val, pred(c));
     return !val;
@@ -164,8 +220,7 @@ private:
   int offset_;
 };
 
-Bit ForEvery2(
-    std::function<std::optional<Bit>(BitStream *, BitStream *)> pred) {
+template <typename Predicate2Ty> Bit ForEvery2(Predicate2Ty pred) {
   return ForEvery([=](BitStream *product) {
     StridedBitStream a(product, /*stride=*/2, /*offset=*/0);
     StridedBitStream b(product, /*stride=*/2, /*offset=*/1);
@@ -173,9 +228,8 @@ Bit ForEvery2(
   });
 }
 
-template <typename T>
-Bit Equal(std::function<std::optional<T>(BitStream *)> f_a,
-          std::function<std::optional<T>(BitStream *)> f_b) {
+template <typename T, typename PredicateTy>
+Bit Equal(PredicateTy f_a, PredicateTy f_b) {
   auto check = [=](BitStream *idx) -> std::optional<Bit> {
     ASSIGN_OR_RETURN(T, a, f_a(idx));
     ASSIGN_OR_RETURN(T, b, f_b(idx));
@@ -198,7 +252,8 @@ std::optional<Bit> FuncG(BitStream *a) {
   return t2 * t0;
 }
 
-Natural Least(std::function<bool(Natural)> fn) {
+template <typename PredicateNoOptionalTy>
+Natural Least(PredicateNoOptionalTy fn) {
   Natural i = 0;
   while (!fn(i)) {
     i++;
@@ -218,8 +273,7 @@ std::optional<bool> Eq(Natural n, BitStream *a, BitStream *b) {
   return true;
 }
 
-template <typename T>
-Natural Modulus(std::function<std::optional<T>(BitStream *)> fn) {
+template <typename T, typename PredicateTy> Natural Modulus(PredicateTy fn) {
   auto is_modulus = [=](Natural n) {
     return ForEvery2([=](BitStream *a, BitStream *b) -> std::optional<Bit> {
       ASSIGN_OR_RETURN(bool, equal, Eq(n, a, b));
