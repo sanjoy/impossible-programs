@@ -1,3 +1,5 @@
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -6,37 +8,13 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-template <typename T> struct is_optional {
-  static constexpr bool value = false;
-};
-
-template <typename T> struct is_optional<std::optional<T>> {
-  static constexpr bool value = true;
-};
-
-#define ASSIGN_OR_RETURN(type, var, expr)                                      \
-  static_assert(is_optional<decltype(expr)>::value);                           \
-  type var;                                                                    \
-  do {                                                                         \
-    auto __tmp = (expr);                                                       \
-    if (!__tmp.has_value()) {                                                  \
-      return std::nullopt;                                                     \
-    }                                                                          \
-    var = *__tmp;                                                              \
-  } while (false)
-
-#ifdef ENABLE_LOG
-#define LOG(str, ...)                                                          \
-  printf("[%s/%s:%d] " str "\n", __FILE__, __func__, __LINE__, __VA_ARGS__)
-#else
-#define LOG(str, ...) (void)0
-#endif
+#include "utils.h"
 
 using Bit = bool;
 using Natural = uint64_t;
 
-class BitSet {
+// Set of natural numbers, implemented as a bitset.
+class SetOfNaturals {
 public:
   void Clear() { rep_.clear(); }
 
@@ -65,70 +43,71 @@ private:
   std::vector<bool> rep_;
 };
 
-class BitStream {
+// A possibly infinite sequence of bits.
+class BitSequence {
 public:
+  // Subclasses override this method to provide class specific functionality.
+  //
+  // Either returns a bit or a sentinel value (std::optional).
   virtual std::optional<Bit> Get(Natural) = 0;
-  virtual ~BitStream() {}
+  virtual ~BitSequence() {}
 };
 
-class StrictBitStream : public BitStream {
+// This bit sequence contains a finite prefix of an infinite bit sequence.
+//
+// If the caller asks for bits beyond the prefix it was told about, it returns
+// the sentinel.  It also keeps track of the indices that it returned sentinel
+// for.
+class LazyBitSequence : public BitSequence {
 public:
-  explicit StrictBitStream(std::vector<Bit> values) : rep_(std::move(values)) {}
-  std::optional<Bit> Get(Natural idx) override { return rep_[idx]; }
-  virtual ~StrictBitStream() override {}
-
-private:
-  std::vector<bool> rep_;
-};
-
-class LazyBitStream : public BitStream {
-public:
-  explicit LazyBitStream(const std::vector<Bit> *values,
-                         const BitSet *indices_present,
-                         BitSet *indices_requested)
+  explicit LazyBitSequence(const std::vector<Bit> *values,
+                           const SetOfNaturals *indices_present,
+                           SetOfNaturals *unfulfilled_indices)
       : values_(*values), indices_present_(*indices_present),
-        indices_requested_(indices_requested) {}
-  virtual ~LazyBitStream() override {}
+        unfulfilled_indices_(unfulfilled_indices) {}
+  virtual ~LazyBitSequence() override {}
 
   std::optional<Bit> Get(Natural idx) override {
     if (indices_present_.Contains(idx)) {
       return values_[idx];
     }
 
-    indices_requested_->Insert(idx);
+    unfulfilled_indices_->Insert(idx);
     return std::nullopt;
   }
 
 private:
   const std::vector<bool> &values_;
-  const BitSet &indices_present_;
-  BitSet *indices_requested_;
+  const SetOfNaturals &indices_present_;
+  SetOfNaturals *unfulfilled_indices_;
 };
 
-class OnlyOneActiveFind {
+// Used to check that we have only one active ForSome in a thread.
+class OnlyOneActiveForSome {
 public:
-  OnlyOneActiveFind() {
+  OnlyOneActiveForSome() {
     if (find_is_active_) {
+      printf("Multiple active ForSome frames on the same thread!\n");
       abort();
     }
 
     find_is_active_ = true;
   }
 
-  ~OnlyOneActiveFind() { find_is_active_ = false; }
+  ~OnlyOneActiveForSome() { find_is_active_ = false; }
 
 private:
   static thread_local bool find_is_active_;
 };
 
-/*static*/ bool thread_local OnlyOneActiveFind::find_is_active_ = false;
+/*static*/ bool thread_local OnlyOneActiveForSome::find_is_active_ = false;
 
 template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
-  OnlyOneActiveFind nfs;
+  OnlyOneActiveForSome nfs;
 
   std::vector<bool> scratch;
-  BitSet indices_of_bits_present;
-  BitSet indices_of_bits_requested;
+  SetOfNaturals indices_of_bits_present;
+  SetOfNaturals indices_of_bits_requested;
   while (true) {
     bool current_modulus_too_small = false;
     LOG("Entering inner loop with indices_of_bits_present.size() = %lld",
@@ -160,8 +139,8 @@ template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
       }
 #endif
 
-      LazyBitStream lazy_bit_stream(&scratch, &indices_of_bits_present,
-                                    &indices_of_bits_requested);
+      LazyBitSequence lazy_bit_stream(&scratch, &indices_of_bits_present,
+                                      &indices_of_bits_requested);
 
       std::optional<Bit> result = predicate(&lazy_bit_stream);
       if (result.has_value() && *result) {
@@ -169,6 +148,12 @@ template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
       }
 
       if (!result.has_value()) {
+        // This is where we need the condition asserted by OnlyOneActiveForSome.
+        //
+        // We assume that if `predicate` has returned the sentinel value then it
+        // must have run out of bits.  But that is not necessary if we allowed
+        // nested ForSome calls -- it could have run out of bits in the
+        // LazyBitSequence provided by an "outer" ForSome.
         Natural new_scratch_size = scratch.size();
         indices_of_bits_requested.ForEach([&](Natural requested_index) {
           LOG("New index requested: %llu", requested_index);
@@ -198,16 +183,18 @@ template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
 }
 
 template <typename PredicateTy> Bit ForEvery(PredicateTy pred) {
-  auto inverse_pred = [=](BitStream *c) -> std::optional<Bit> {
+  auto inverse_pred = [=](BitSequence *c) -> std::optional<Bit> {
     ASSIGN_OR_RETURN(Bit, val, pred(c));
     return !val;
   };
   return !ForSome(inverse_pred);
 }
 
-class StridedBitStream : public BitStream {
+// Can be used to map a single bit sequence into N bit sequences, each reading
+// mapping bit `I` to bit `N*I+J` in the main sequence, with 0 <= `J` < N.
+class StridedBitSequence : public BitSequence {
 public:
-  StridedBitStream(BitStream *source, int stride, int offset)
+  StridedBitSequence(BitSequence *source, int stride, int offset)
       : source_(source), stride_(stride), offset_(offset) {}
 
   std::optional<Bit> Get(Natural idx) override {
@@ -215,41 +202,27 @@ public:
   }
 
 private:
-  BitStream *source_;
+  BitSequence *source_;
   int stride_;
   int offset_;
 };
 
 template <typename Predicate2Ty> Bit ForEvery2(Predicate2Ty pred) {
-  return ForEvery([=](BitStream *product) {
-    StridedBitStream a(product, /*stride=*/2, /*offset=*/0);
-    StridedBitStream b(product, /*stride=*/2, /*offset=*/1);
+  return ForEvery([=](BitSequence *product) {
+    StridedBitSequence a(product, /*stride=*/2, /*offset=*/0);
+    StridedBitSequence b(product, /*stride=*/2, /*offset=*/1);
     return pred(&a, &b);
   });
 }
 
 template <typename T, typename PredicateTy>
 Bit Equal(PredicateTy f_a, PredicateTy f_b) {
-  auto check = [=](BitStream *idx) -> std::optional<Bit> {
+  auto check = [=](BitSequence *idx) -> std::optional<Bit> {
     ASSIGN_OR_RETURN(T, a, f_a(idx));
     ASSIGN_OR_RETURN(T, b, f_b(idx));
     return a == b;
   };
   return ForEvery(check);
-}
-
-std::optional<Bit> FuncF(BitStream *a) {
-  ASSIGN_OR_RETURN(Bit, t0, a->Get(4));
-  ASSIGN_OR_RETURN(Bit, t1, a->Get(t0 * 7));
-  ASSIGN_OR_RETURN(Bit, t2, a->Get(7));
-  return t0 * 7 + t1 * t2;
-}
-
-std::optional<Bit> FuncG(BitStream *a) {
-  ASSIGN_OR_RETURN(Bit, t0, a->Get(4));
-  ASSIGN_OR_RETURN(Bit, t1, a->Get(7));
-  ASSIGN_OR_RETURN(Bit, t2, a->Get(t0 + 11 * t1));
-  return t2 * t0;
 }
 
 template <typename PredicateNoOptionalTy>
@@ -261,7 +234,7 @@ Natural Least(PredicateNoOptionalTy fn) {
   return i;
 }
 
-std::optional<bool> Eq(Natural n, BitStream *a, BitStream *b) {
+std::optional<bool> Eq(Natural n, BitSequence *a, BitSequence *b) {
   for (Natural i = 0; i < n; i++) {
     ASSIGN_OR_RETURN(Bit, ai, a->Get(i));
     ASSIGN_OR_RETURN(Bit, bi, b->Get(i));
@@ -275,7 +248,7 @@ std::optional<bool> Eq(Natural n, BitStream *a, BitStream *b) {
 
 template <typename T, typename PredicateTy> Natural Modulus(PredicateTy fn) {
   auto is_modulus = [=](Natural n) {
-    return ForEvery2([=](BitStream *a, BitStream *b) -> std::optional<Bit> {
+    return ForEvery2([=](BitSequence *a, BitSequence *b) -> std::optional<Bit> {
       ASSIGN_OR_RETURN(bool, equal, Eq(n, a, b));
       if (!equal) {
         return true;
@@ -289,18 +262,23 @@ template <typename T, typename PredicateTy> Natural Modulus(PredicateTy fn) {
   return Least(is_modulus);
 }
 
-#define PRINT_EXPR_IMPL(expr, fmt_str, conversion)                             \
-  do {                                                                         \
-    auto __val = (expr);                                                       \
-    printf("%s = " fmt_str "\n", #expr, conversion);                           \
-  } while (false)
+std::optional<Bit> FuncF(BitSequence *a) {
+  ASSIGN_OR_RETURN(Bit, t0, a->Get(4));
+  ASSIGN_OR_RETURN(Bit, t1, a->Get(t0 * 7));
+  ASSIGN_OR_RETURN(Bit, t2, a->Get(7));
+  return t0 * 7 + t1 * t2;
+}
 
-#define PRINT_BIT_EXPR(expr)                                                   \
-  PRINT_EXPR_IMPL(expr, "%s", __val ? "true" : "false")
-
-#define PRINT_NAT_EXPR(expr) PRINT_EXPR_IMPL(expr, "%llu", __val)
+std::optional<Bit> FuncG(BitSequence *a) {
+  ASSIGN_OR_RETURN(Bit, t0, a->Get(4));
+  ASSIGN_OR_RETURN(Bit, t1, a->Get(7));
+  ASSIGN_OR_RETURN(Bit, t2, a->Get(t0 + 11 * t1));
+  return t2 * t0;
+}
 
 void TestA() {
+  CREATE_TIMER();
+
   PRINT_BIT_EXPR(Equal<Bit>(FuncF, FuncF));
   PRINT_BIT_EXPR(Equal<Bit>(FuncG, FuncG));
 
@@ -310,6 +288,5 @@ void TestA() {
   PRINT_NAT_EXPR(Modulus<Bit>(FuncF));
   PRINT_NAT_EXPR(Modulus<Bit>(FuncG));
 }
-} // namespace
 
 int main() { TestA(); }
