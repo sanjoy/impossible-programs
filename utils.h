@@ -97,4 +97,32 @@ template <typename T> struct is_optional<std::optional<T>> {
 #define LOG(str, ...) (void)0
 #endif
 
+// Used to check that we have only one active call to a function in a thread.
+// Don't use this class directly, use ASSERT_ONLY_ONE_ACTIVE_CALL instead.
+template <int *FuncId> class AssertOnlyOneActiveCall {
+public:
+  explicit AssertOnlyOneActiveCall(const char *function_name) {
+    if (find_is_active_) {
+      printf("Multiple active %s frames on the same thread!\n", function_name);
+      abort();
+    }
+
+    find_is_active_ = true;
+  }
+
+  ~AssertOnlyOneActiveCall() { find_is_active_ = false; }
+
+private:
+  static thread_local bool find_is_active_;
+};
+
+template <int *FuncId>
+/*static*/ bool thread_local AssertOnlyOneActiveCall<FuncId>::find_is_active_ =
+    false;
+
+#define ASSERT_ONLY_ONE_ACTIVE_CALL()                                          \
+  static int __only_one_active_call_id;                                        \
+  AssertOnlyOneActiveCall<&__only_one_active_call_id> __only_one_active_call(  \
+      __func__);
+
 #endif

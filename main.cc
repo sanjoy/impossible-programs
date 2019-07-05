@@ -82,28 +82,8 @@ private:
   SetOfNaturals *unfulfilled_indices_;
 };
 
-// Used to check that we have only one active ForSome in a thread.
-class OnlyOneActiveForSome {
-public:
-  OnlyOneActiveForSome() {
-    if (find_is_active_) {
-      printf("Multiple active ForSome frames on the same thread!\n");
-      abort();
-    }
-
-    find_is_active_ = true;
-  }
-
-  ~OnlyOneActiveForSome() { find_is_active_ = false; }
-
-private:
-  static thread_local bool find_is_active_;
-};
-
-/*static*/ bool thread_local OnlyOneActiveForSome::find_is_active_ = false;
-
 template <typename PredicateTy> Bit ForSome(PredicateTy predicate) {
-  OnlyOneActiveForSome nfs;
+  ASSERT_ONLY_ONE_ACTIVE_CALL();
 
   std::vector<bool> scratch;
   SetOfNaturals indices_of_bits_present;
